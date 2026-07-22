@@ -245,7 +245,12 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
         let out = child.wait_with_output().unwrap();
         parse_cycles(&String::from_utf8_lossy(&out.stdout))
     }
@@ -257,7 +262,12 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
         let out = child.wait_with_output().unwrap();
         String::from_utf8_lossy(&out.stdout).into_owned()
     }

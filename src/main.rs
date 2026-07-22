@@ -98,8 +98,9 @@ fn main() -> Result<()> {
 
 fn write_output(path: &Option<PathBuf>, content: &str) -> Result<()> {
     match path {
-        Some(path) => fs::write(path, content)
-            .with_context(|| format!("failed to write {}", path.display())),
+        Some(path) => {
+            fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
+        }
         None => {
             print!("{}", content);
             Ok(())

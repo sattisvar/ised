@@ -46,7 +46,9 @@ pub fn run_full(wrapped_script: &str, all_lines: &[String]) -> Result<Vec<Cycle>
         .write_all(input.as_bytes())
         .context("failed to write to sed stdin")?;
 
-    let output = child.wait_with_output().context("sed did not exit cleanly")?;
+    let output = child
+        .wait_with_output()
+        .context("sed did not exit cleanly")?;
     if !output.status.success() {
         anyhow::bail!(
             "sed exited with {}: {}",
