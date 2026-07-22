@@ -14,7 +14,9 @@
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::ExecutableCommand;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -92,7 +94,7 @@ pub fn run(session: &mut Session) -> Result<Option<Vec<Option<bool>>>> {
 /// which seemed less clear than the small duplication.
 fn find_first_diff(session: &mut Session, decisions: &mut [Option<bool>]) -> Result<Option<usize>> {
     let mut prev_hold = session.hold_active().then(String::new);
-    for i in 0..decisions.len() {
+    for (i, decision) in decisions.iter_mut().enumerate() {
         let raw = session.raw_input(i);
         let record = session.get(i)?;
         let pattern_changed = raw != record.pattern_after;
@@ -100,7 +102,7 @@ fn find_first_diff(session: &mut Session, decisions: &mut [Option<bool>]) -> Res
         if pattern_changed || hold_changed || !record.printed {
             return Ok(Some(i));
         }
-        decisions[i] = Some(true);
+        *decision = Some(true);
         prev_hold = record.hold_after.clone();
     }
     Ok(None)
@@ -175,7 +177,10 @@ fn draw(f: &mut Frame, session: &mut Session, cursor: usize, decisions: &[Option
             };
             let text = format!("{} {:>7}  {}", marker, label, preview);
             let style = if i == cursor {
-                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 match decisions[i] {
                     Some(true) => Style::default().fg(Color::Green),
@@ -229,7 +234,11 @@ fn draw(f: &mut Frame, session: &mut Session, cursor: usize, decisions: &[Option
     }
 }
 
-fn diff_paragraphs<'a>(before: &'a str, after: &'a str, printed: bool) -> (Paragraph<'a>, Paragraph<'a>) {
+fn diff_paragraphs<'a>(
+    before: &'a str,
+    after: &'a str,
+    printed: bool,
+) -> (Paragraph<'a>, Paragraph<'a>) {
     let diff = TextDiff::from_words(before, after);
 
     let mut before_spans = Vec::new();
@@ -238,11 +247,15 @@ fn diff_paragraphs<'a>(before: &'a str, after: &'a str, printed: bool) -> (Parag
         match change.tag() {
             ChangeTag::Delete => before_spans.push(Span::styled(
                 change.to_string(),
-                Style::default().fg(Color::Red).add_modifier(Modifier::CROSSED_OUT),
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::CROSSED_OUT),
             )),
             ChangeTag::Insert => after_spans.push(Span::styled(
                 change.to_string(),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             )),
             ChangeTag::Equal => {
                 before_spans.push(Span::raw(change.to_string()));
@@ -257,7 +270,11 @@ fn diff_paragraphs<'a>(before: &'a str, after: &'a str, printed: bool) -> (Parag
         "pattern space: after (deleted — no output for this block)"
     };
     let before_p = Paragraph::new(spans_to_lines(before_spans))
-        .block(UiBlock::default().borders(Borders::ALL).title("pattern space: before"))
+        .block(
+            UiBlock::default()
+                .borders(Borders::ALL)
+                .title("pattern space: before"),
+        )
         .wrap(ratatui::widgets::Wrap { trim: false });
     let after_p = Paragraph::new(spans_to_lines(after_spans))
         .block(UiBlock::default().borders(Borders::ALL).title(after_title))
