@@ -1,3 +1,11 @@
+//! CLI entry point and final output reconstruction.
+//!
+//! Module map, in dependency order: `instrument` (build the self-reporting
+//! sed script) -> `runner` (shell out to real sed) -> `session` (group its
+//! reported cycles into `state::Block`s) -> `ui` (walk the user through
+//! them, collect accept/reject decisions) -> back here to turn those
+//! decisions into the final text.
+
 mod instrument;
 mod runner;
 mod session;
@@ -39,6 +47,12 @@ fn main() -> Result<()> {
         }
     };
 
+    // `.lines()` strips whatever line ending was present (and any final
+    // line lacking one); reconstruction below always re-adds a plain '\n'
+    // per emitted block, so an input with no trailing newline or with
+    // CRLF endings won't come back byte-for-byte identical even when every
+    // block is accepted unchanged. Not currently treated as a bug worth
+    // fixing since sed itself normalizes line endings the same way.
     let lines: Vec<String> = input.lines().map(str::to_string).collect();
     if lines.is_empty() {
         eprintln!("no input lines");
@@ -57,10 +71,21 @@ fn main() -> Result<()> {
     for (i, decision) in decisions.iter().enumerate() {
         // A block that `d`/`D` deleted never produces real output, no
         // matter what the user decided about its (informational-only) diff.
+        // See `state::Block::printed`'s doc comment for the caveat around
+        // scripts with their own explicit `p`/`P` mid-script — those can
+        // still produce real output on a `printed == false` block that
+        // this loop has no way to know about and will drop.
         if !session.printed(i) {
             continue;
         }
         let raw = session.raw_input(i);
+        // `Some(false)` (explicitly rejected) and `None` (never reviewed —
+        // e.g. the user quit partway through) are handled identically:
+        // both fall back to the untouched raw text. `unwrap_or(&raw)` on
+        // the accepted branch only falls back to raw in the defensive
+        // "queried before computed" case described on `cached_pattern` —
+        // it can't actually happen here since `i` only ranges over blocks
+        // `ui::run` already computed.
         let text = match decision {
             Some(true) => session.cached_pattern(i).unwrap_or(&raw).to_string(),
             _ => raw,

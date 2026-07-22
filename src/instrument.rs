@@ -1,5 +1,28 @@
+//! Turns a user-supplied sed script into a self-instrumented version of
+//! itself: same script, same real behaviour, but it also reports its own
+//! internal state (pattern space, hold space, current line number) as it
+//! runs, by appending extra sed commands after the user's script and
+//! rewriting the couple of commands (`d`, `D`) that would otherwise skip
+//! past that appended code.
+//!
+//! Why instrument sed instead of reimplementing it: sed's actual behaviour
+//! (BRE/ERE quirks, GNU extensions, `N`-at-EOF handling, etc.) is exactly
+//! what we want to preview, so the only way to guarantee we show the truth
+//! is to have the real `sed` binary run the real script and ask it to also
+//! tell us what it's doing, rather than modeling sed ourselves and risking
+//! divergence from the user's actual sed.
+//!
+//! The output is designed to be parsed strictly line-by-line by
+//! `parse_cycles`, which is why every value we extract (pattern space, hold
+//! space) gets its embedded real newlines swapped for `NL_PLACEHOLDER`
+//! before being tagged and printed, then swapped back on the way out.
+
 use regex::Regex;
 
+// \x01/\x02 (SOH/STX) rather than something printable: any printable tag
+// could collide with real line content the user is editing; these bytes
+// essentially never occur in text files sed is used on. It's a heuristic,
+// not a guarantee — see the module-level limitations note.
 const TAG_PATTERN: &str = "\x01P\x01";
 const TAG_DELETED: &str = "\x01X\x01";
 const TAG_HOLD: &str = "\x01H\x01";
@@ -8,6 +31,11 @@ const TAG_HOLD: &str = "\x01H\x01";
 // before printing and restore it in `parse_cycles`.
 const NL_PLACEHOLDER: char = '\x02';
 
+// Label names sed branches to. Must not collide with any label the user's
+// own script defines — "ISED_*" is chosen to be unlikely, not guaranteed;
+// a script that happens to define e.g. `:ISED_END` itself would silently
+// misbehave (last-writer-wins on the label, since sed doesn't error on
+// duplicate labels). Not currently validated against.
 const DEL_LABEL: &str = "ISED_DEL";
 const END_LABEL: &str = "ISED_END";
 const TOP_LABEL: &str = "ISED_TOP";
@@ -18,6 +46,16 @@ const TOP_LABEL: &str = "ISED_TOP";
 /// still learn the pattern/hold space at the moment of deletion and record
 /// that this cycle produced no real output. `d` takes no argument, so this
 /// looks for the letter standing alone as a command token.
+///
+/// The boundary character class in the regex is a heuristic covering the
+/// common ways a command can be preceded/followed in real scripts
+/// (separators, block braces, digit/`$`/`,`/`!` from addresses, `/` from a
+/// regex-address delimiter) — not a real sed grammar parse. It can misfire
+/// on unusual constructs (e.g. a custom regex-address delimiter other than
+/// `/`, like `\%...%d`) by failing to rewrite a `d` that should have been,
+/// silently reverting to the old "skips instrumentation" behaviour for that
+/// command rather than erroring. Same caveat applies to `rewrite_d_upper`
+/// and `uses_hold_space` below, which use the same boundary class.
 fn rewrite_delete(user_script: &str) -> String {
     let re = Regex::new(r"(^|[;{}\n\s0-9$,!/])d($|[;}\n\s])").unwrap();
     re.replace_all(user_script, |caps: &regex::Captures| {
@@ -32,6 +70,14 @@ fn rewrite_delete(user_script: &str) -> String {
 /// the top, without reading new input* — the classic sliding-window loop.
 /// We reproduce that restart-without-read behaviour with our own `t`-gated
 /// branch back to a label placed before the user's script.
+///
+/// The replacement is a `{ ... }` group rather than a single command. This
+/// matters because sed addresses (the possibly-nonempty text captured in
+/// group 1, e.g. `$` in `$D`) apply to exactly one command *or* one `{}`
+/// block — since that address text is left untouched right before our
+/// group, `$D` naturally becomes `${ ... }`, still correctly scoped,
+/// without this function ever needing to parse what the address actually
+/// was.
 fn rewrite_d_upper(user_script: &str) -> String {
     let re = Regex::new(r"(^|[;{}\n\s0-9$,!/])D($|[;}\n\s])").unwrap();
     re.replace_all(user_script, |caps: &regex::Captures| {
@@ -57,6 +103,29 @@ fn rewrite_d_upper(user_script: &str) -> String {
 /// afterwards so the rest of the script's semantics are unaffected on the
 /// next cycle; pattern space is left mutated since it is discarded (by a
 /// real next-line read) before it would matter.
+/// This assumes the caller invokes sed with `-n` (see `runner::run_full`) —
+/// the `p` right after the user's script stands in for autoprint, which we
+/// disable globally so we control exactly when it fires (never, on the
+/// `d`/`D` path). Running this wrapped script without `-n` would double
+/// every real print.
+///
+/// Structure of the generated script, in order:
+///  1. `:TOP` — sits *before* the user's script so `D`'s rewritten branch
+///     (see `rewrite_d_upper`) can loop back into it, re-entering the
+///     script body with the trimmed pattern space and no new read.
+///  2. the user's script (with `d`/`D` rewritten).
+///  3. the "printed" path — reached only if the script fell through
+///     normally (no `d`/`D` fired) — tags and prints pattern space, then
+///     branches past the deleted path below.
+///  4. `:DEL`, the "deleted" path — reached only via a rewritten `d`/`D` —
+///     tags and prints pattern space the same way, just under a different
+///     tag, then falls through to the same convergence point as step 3.
+///  5. `:END` — the one point reached exactly once per *external* cycle,
+///     whichever path got here — `=` reports the real current line number
+///     and the hold space gets tagged, printed, and (unlike pattern space
+///     above, which is left mutated since it's discarded by the next real
+///     read) restored exactly, or every later h/H/g/G/x in the user's
+///     script would silently operate on corrupted hold-space content.
 pub fn wrap_script(user_script: &str) -> String {
     let rewritten = rewrite_d_upper(&rewrite_delete(user_script));
     format!(
@@ -99,8 +168,18 @@ pub fn uses_hold_space(user_script: &str) -> bool {
 
 pub struct Cycle {
     pub pattern_space: String,
-    /// Whether this cycle would really print (autoprint reached) vs `d`/`D`
-    /// deleting the pattern space and suppressing output entirely.
+    /// Whether this cycle reaches *our* print (i.e. autoprint would have
+    /// fired in the real script) vs `d`/`D` deleting the pattern space and
+    /// routing to the deleted path instead.
+    ///
+    /// This is *not* "whether the real script produced any output at all"
+    /// — a script with its own explicit `p`/`P`/`w` mid-script (the classic
+    /// `N;P;D` "print sliding window" idiom, for instance) can produce real
+    /// output on the deleted path too, via that explicit print, which this
+    /// tool doesn't currently track or correlate to a block (see the note
+    /// at the bottom of `parse_cycles`'s loop). For such scripts, `printed
+    /// == false` blocks may still have contributed real output that this
+    /// tool won't show or let the user accept/reject.
     pub printed: bool,
     pub hold_space: String,
     /// The real 1-indexed line number reached when this cycle ended — i.e.
@@ -138,6 +217,14 @@ pub fn parse_cycles(stdout: &str) -> Vec<Cycle> {
         }
         // any other line is real program output (only relevant if the
         // script itself prints extra things via `p`/`P`) — ignored for now.
+        //
+        // Note this means any explicit p/P/w output in the user's own
+        // script that happens to be a bare integer would be silently
+        // (mis)read as our `=` line number here, and non-numeric explicit
+        // output is silently dropped. Both are instances of the same
+        // unaddressed gap: explicit output isn't correlated to a block at
+        // all (see the `printed` field's doc comment for the broader
+        // implication this has for scripts like `N;P;D`).
     }
 
     cycles

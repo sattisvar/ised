@@ -8,6 +8,12 @@ use crate::state::Block;
 /// resulting cycles into `Block`s: each block is one or more consecutive
 /// raw input lines that a single external cycle consumed together (more
 /// than one line only when the script uses `N`).
+///
+/// Computation is lazy (triggered by the first call to `get`/`block_count`,
+/// not by `new`) purely so construction can't fail: `Session::new` has no
+/// `Result`, which keeps callers simple, and the one real sed invocation
+/// this does is cheap enough overall that there's no reason to eagerly run
+/// it before the caller is ready to look at the result.
 pub struct Session {
     lines: Vec<String>,
     wrapped_script: String,
@@ -35,7 +41,9 @@ impl Session {
         let cycles = runner::run_full(&self.wrapped_script, &self.lines)?;
 
         let mut blocks = Vec::with_capacity(cycles.len());
-        let mut prev_end = 0usize; // 1-indexed line number consumed so far
+        // 1-indexed count of real input lines consumed so far — 0 means
+        // none yet, which conveniently is also block 0's 0-indexed start.
+        let mut prev_end = 0usize;
         for cycle in cycles {
             anyhow::ensure!(
                 cycle.end_line > prev_end,
@@ -79,10 +87,20 @@ impl Session {
         self.hold_active
     }
 
+    /// Defaults to `true` (i.e. "don't suppress output") if `idx` is ever
+    /// queried before `ensure_computed` has run — this can't happen through
+    /// `ui`/`main`'s normal call order (they always `get` a block before
+    /// asking about it), so this is a defensive fallback, not a real code
+    /// path; picking the fail-safe direction (show it) rather than
+    /// silently dropping content if that invariant is ever violated.
     pub fn printed(&self, idx: usize) -> bool {
         self.blocks.get(idx).map(|b| b.printed).unwrap_or(true)
     }
 
+    /// `None` only in the same "queried before computed" situation as
+    /// `printed` above — real callers always check `printed`/call `get`
+    /// first, so `main.rs` unwrapping this is safe in practice, not
+    /// reflecting an expected-to-happen case.
     pub fn cached_pattern(&self, idx: usize) -> Option<&str> {
         self.blocks.get(idx).map(|b| b.pattern_after.as_str())
     }

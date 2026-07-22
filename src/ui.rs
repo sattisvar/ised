@@ -1,3 +1,17 @@
+//! The review TUI. `decisions[i]` always corresponds to `Session`'s block
+//! `i` — the two are kept in lockstep by construction (both sized from
+//! `session.block_count()` in `run`, never resized after) rather than via
+//! any shared key, so an index mismatch between them would be a bug with
+//! no type-level guard against it.
+//!
+//! Everywhere `session.get(idx)`/`session.raw_input(idx)` is called without
+//! checking bounds first (`draw`'s `expect`s, `find_first_diff`,
+//! `advance_past_noops`), it relies on the invariant that `cursor` is only
+//! ever moved to an index the caller has already `get`-ed successfully (or
+//! 0, which always exists once `run` gets past the `block_count` call). If
+//! that invariant is ever broken by a future change to the key handling in
+//! `run`, these will panic rather than silently show wrong data.
+
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -67,6 +81,15 @@ pub fn run(session: &mut Session) -> Result<Option<Vec<Option<bool>>>> {
 /// empty state, or the block gets deleted and produces no real output),
 /// marking every no-op block along the way as auto-accepted. Returns `None`
 /// if nothing in the whole file changes anything.
+///
+/// This duplicates most of `advance_past_noops` rather than sharing a loop
+/// body with it: that function always starts from a block that's already
+/// been decided (the just-`y`/`n`-ed one) and compares against *its* hold
+/// space, whereas this one has to also examine block 0 itself against the
+/// hold space's initial (pre-any-cycle) empty state, and there's no
+/// "previous block" to decide before block 0 to hang that comparison off
+/// of. Folding them into one function would need a sentinel starting index,
+/// which seemed less clear than the small duplication.
 fn find_first_diff(session: &mut Session, decisions: &mut [Option<bool>]) -> Result<Option<usize>> {
     let mut prev_hold = session.hold_active().then(String::new);
     for i in 0..decisions.len() {
@@ -122,6 +145,13 @@ fn draw(f: &mut Frame, session: &mut Session, cursor: usize, decisions: &[Option
     let total = decisions.len();
     // Borders take the top and bottom row of the panel.
     let visible = outer[0].height.saturating_sub(2).max(1) as usize;
+    // Keep the cursor vertically centered, except clamp so we never scroll
+    // past either end of the list — `saturating_sub` handles the start
+    // clamp (can't go below 0), `.min(total - visible)` handles the end
+    // clamp (can't scroll far enough that blank space would show past the
+    // last block). Deliberately not using ratatui's ListState built-in
+    // scroll-to-selected, which only scrolls the minimum needed to keep the
+    // selection in view rather than centering it.
     let top = if total <= visible {
         0
     } else {
@@ -238,13 +268,21 @@ fn diff_paragraphs<'a>(before: &'a str, after: &'a str, printed: bool) -> (Parag
 
 /// Splits a flat run of spans into multiple `Line`s at any literal newline
 /// inside a span's text — needed once blocks can span several raw lines
-/// (via `N`), since a `Line` widget otherwise renders on a single row.
+/// (via `N`), since ratatui's `Line` always renders as a single terminal
+/// row and just shows embedded `\n` bytes as visible garbage rather than
+/// wrapping. `TextDiff::from_words` treats a run of embedded newlines/
+/// whitespace as tokens like any other, so a multi-line diff naturally
+/// produces spans whose `content` itself contains `\n` — this walks those
+/// spans and re-homes each newline-separated fragment into its own `Line`,
+/// preserving that fragment's original style.
 fn spans_to_lines(spans: Vec<Span<'_>>) -> Text<'_> {
     let mut lines = Vec::new();
     let mut current: Vec<Span> = Vec::new();
     for span in spans {
         let style = span.style;
         let mut parts = span.content.split('\n');
+        // First fragment continues the line-in-progress; every fragment
+        // after that starts a new one (that's what `\n` means).
         if let Some(first) = parts.next() {
             current.push(Span::styled(first.to_string(), style));
         }
