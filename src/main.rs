@@ -50,26 +50,22 @@ fn main() -> Result<()> {
 
     let Some(decisions) = ui::run(&mut session)? else {
         eprintln!("no changes: this script does not modify any line of the input");
-        let mut output = String::new();
-        for i in 0..session.total_lines() {
-            output.push_str(session.line_text(i));
-            output.push('\n');
-        }
-        return write_output(&args.output, &output);
+        return write_output(&args.output, &input);
     };
 
     let mut output = String::new();
     for (i, decision) in decisions.iter().enumerate() {
-        // A line that `d` deleted never produces real output, no matter
-        // what the user decided about its (informational-only) diff.
+        // A block that `d`/`D` deleted never produces real output, no
+        // matter what the user decided about its (informational-only) diff.
         if !session.printed(i) {
             continue;
         }
-        let line = match decision {
-            Some(true) => session.cached_pattern(i).unwrap_or_else(|| session.line_text(i)),
-            _ => session.line_text(i),
+        let raw = session.raw_input(i);
+        let text = match decision {
+            Some(true) => session.cached_pattern(i).unwrap_or(&raw).to_string(),
+            _ => raw,
         };
-        output.push_str(line);
+        output.push_str(&text);
         output.push('\n');
     }
     write_output(&args.output, &output)

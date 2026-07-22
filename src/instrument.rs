@@ -10,6 +10,7 @@ const NL_PLACEHOLDER: char = '\x02';
 
 const DEL_LABEL: &str = "ISED_DEL";
 const END_LABEL: &str = "ISED_END";
+const TOP_LABEL: &str = "ISED_TOP";
 
 /// A bare `d` normally deletes pattern space and jumps straight to the next
 /// cycle, skipping any script text after it — including our instrumentation.
@@ -25,16 +26,42 @@ fn rewrite_delete(user_script: &str) -> String {
     .into_owned()
 }
 
-/// Wraps a user sed script so that, at the end of every cycle, it emits the
-/// final pattern space (tagged `printed` if a real autoprint would have
-/// happened, `deleted` if `d` fired) and the hold space, each on their own
-/// (single, newline-free) line. Hold space is restored exactly afterwards
-/// so the rest of the script's semantics are unaffected on the next cycle;
-/// pattern space is left mutated since it is discarded on the next read.
+/// A bare `D`: if pattern space has no embedded newline, behaves exactly
+/// like `d` (branch to our deleted-tag path). Otherwise it deletes up to
+/// and including the first embedded newline and restarts the script *from
+/// the top, without reading new input* — the classic sliding-window loop.
+/// We reproduce that restart-without-read behaviour with our own `t`-gated
+/// branch back to a label placed before the user's script.
+fn rewrite_d_upper(user_script: &str) -> String {
+    let re = Regex::new(r"(^|[;{}\n\s0-9$,!/])D($|[;}\n\s])").unwrap();
+    re.replace_all(user_script, |caps: &regex::Captures| {
+        format!(
+            "{}{{ s/^[^\\n]*\\n//; t {top}; b {del} }}{}",
+            &caps[1],
+            &caps[2],
+            top = TOP_LABEL,
+            del = DEL_LABEL,
+        )
+    })
+    .into_owned()
+}
+
+/// Wraps a user sed script so that, at the end of every *external* cycle
+/// (one that really reads/would-read from the input stream — `D`'s
+/// restart-without-read loop is invisible to this), it emits: the final
+/// pattern space (tagged `printed` if a real autoprint would have happened,
+/// `deleted` if `d`/`D` fired), the real current line number (via `=`, so
+/// callers can tell how many raw input lines — possibly more than one, via
+/// `N` — this cycle actually consumed), and the hold space. Each tag is on
+/// its own (single, newline-free) line. Hold space is restored exactly
+/// afterwards so the rest of the script's semantics are unaffected on the
+/// next cycle; pattern space is left mutated since it is discarded (by a
+/// real next-line read) before it would matter.
 pub fn wrap_script(user_script: &str) -> String {
-    let rewritten = rewrite_delete(user_script);
+    let rewritten = rewrite_d_upper(&rewrite_delete(user_script));
     format!(
-        "{{\n{script}\n}}\n\
+        ":{top}\n\
+         {{\n{script}\n}}\n\
          s/\\n/\\x02/g\n\
          s/^/{ptag}/\n\
          p\n\
@@ -44,6 +71,7 @@ pub fn wrap_script(user_script: &str) -> String {
          s/^/{dtag}/\n\
          p\n\
          :{end}\n\
+         =\n\
          x\n\
          s/\\n/\\x02/g\n\
          s/^/{htag}/\n\
@@ -55,6 +83,7 @@ pub fn wrap_script(user_script: &str) -> String {
         ptag = TAG_PATTERN,
         dtag = TAG_DELETED,
         htag = TAG_HOLD,
+        top = TOP_LABEL,
         del = DEL_LABEL,
         end = END_LABEL,
     )
@@ -70,30 +99,42 @@ pub fn uses_hold_space(user_script: &str) -> bool {
 
 pub struct Cycle {
     pub pattern_space: String,
-    /// Whether this cycle would really print (autoprint reached) vs `d`
+    /// Whether this cycle would really print (autoprint reached) vs `d`/`D`
     /// deleting the pattern space and suppressing output entirely.
     pub printed: bool,
     pub hold_space: String,
+    /// The real 1-indexed line number reached when this cycle ended — i.e.
+    /// the last raw input line this cycle consumed. Consecutive cycles'
+    /// `end_line` values mark off which (possibly multi-line, via `N`)
+    /// block of the input each one covers.
+    pub end_line: usize,
 }
 
 /// Parses the tagged stdout produced by a script wrapped with `wrap_script`,
-/// returning one `Cycle` per input line consumed, in order.
+/// returning one `Cycle` per *external* cycle (see `wrap_script`), in order.
 pub fn parse_cycles(stdout: &str) -> Vec<Cycle> {
     let mut cycles = Vec::new();
-    let mut pending: Option<(String, bool)> = None;
+    let mut pending_pattern: Option<(String, bool)> = None;
+    let mut pending_nr: Option<usize> = None;
 
     for line in stdout.split('\n') {
         if let Some(rest) = line.strip_prefix(TAG_PATTERN) {
-            pending = Some((rest.replace(NL_PLACEHOLDER, "\n"), true));
+            pending_pattern = Some((rest.replace(NL_PLACEHOLDER, "\n"), true));
         } else if let Some(rest) = line.strip_prefix(TAG_DELETED) {
-            pending = Some((rest.replace(NL_PLACEHOLDER, "\n"), false));
+            pending_pattern = Some((rest.replace(NL_PLACEHOLDER, "\n"), false));
         } else if let Some(rest) = line.strip_prefix(TAG_HOLD) {
-            let (pattern_space, printed) = pending.take().unwrap_or_default();
+            let (pattern_space, printed) = pending_pattern.take().unwrap_or_default();
+            let Some(end_line) = pending_nr.take() else {
+                continue; // malformed/unexpected output; skip rather than panic
+            };
             cycles.push(Cycle {
                 pattern_space,
                 printed,
                 hold_space: rest.replace(NL_PLACEHOLDER, "\n"),
+                end_line,
             });
+        } else if let Ok(nr) = line.parse::<usize>() {
+            pending_nr = Some(nr);
         }
         // any other line is real program output (only relevant if the
         // script itself prints extra things via `p`/`P`) — ignored for now.
@@ -122,6 +163,18 @@ mod tests {
         parse_cycles(&String::from_utf8_lossy(&out.stdout))
     }
 
+    fn real_sed_output(script: &str, input: &str) -> String {
+        let mut child = Command::new("sed")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     #[test]
     fn hold_space_detection() {
         assert!(uses_hold_space("H;s/./&&/"));
@@ -137,10 +190,13 @@ mod tests {
         // H appends pattern space to hold *before* the s/// in this script runs.
         assert_eq!(cycles[0].pattern_space, "aa");
         assert!(cycles[0].printed);
+        assert_eq!(cycles[0].end_line, 1);
         assert_eq!(cycles[0].hold_space, "\na");
         assert_eq!(cycles[1].pattern_space, "bb");
+        assert_eq!(cycles[1].end_line, 2);
         assert_eq!(cycles[1].hold_space, "\na\nb");
         assert_eq!(cycles[2].pattern_space, "cc");
+        assert_eq!(cycles[2].end_line, 3);
         assert_eq!(cycles[2].hold_space, "\na\nb\nc");
     }
 
@@ -152,30 +208,68 @@ mod tests {
         assert_eq!(cycles.len(), 3);
 
         assert!(!cycles[0].printed);
+        assert_eq!(cycles[0].end_line, 1);
         assert_eq!(cycles[0].hold_space, "apple");
 
         assert!(!cycles[1].printed);
+        assert_eq!(cycles[1].end_line, 2);
         assert_eq!(cycles[1].hold_space, "apple\nbanana");
 
         assert!(cycles[2].printed);
+        assert_eq!(cycles[2].end_line, 3);
         assert_eq!(cycles[2].pattern_space, "apple, banana, cherry");
 
-        // matches real, unwrapped sed output exactly
-        let mut real = Command::new("sed")
-            .arg(script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        real.stdin
-            .take()
-            .unwrap()
-            .write_all(b"apple\nbanana\ncherry\n")
-            .unwrap();
-        let real_out = real.wait_with_output().unwrap();
         assert_eq!(
-            String::from_utf8_lossy(&real_out.stdout),
+            real_sed_output(script, "apple\nbanana\ncherry\n"),
             "apple, banana, cherry\n"
         );
+    }
+
+    #[test]
+    fn n_merges_pairs_of_lines_into_one_cycle() {
+        // classic "swap adjacent lines" idiom
+        let script = "$!N\ns/\\(.*\\)\\n\\(.*\\)/\\2\\n\\1/";
+        let cycles = run_wrapped(script, "a\nb\nc\nd\n");
+
+        // lines 1-2 merge into one cycle (N), likewise 3-4.
+        assert_eq!(cycles.len(), 2);
+        assert_eq!(cycles[0].end_line, 2);
+        assert_eq!(cycles[0].pattern_space, "b\na");
+        assert_eq!(cycles[1].end_line, 4);
+        assert_eq!(cycles[1].pattern_space, "d\nc");
+
+        assert_eq!(real_sed_output(script, "a\nb\nc\nd\n"), "b\na\nd\nc\n");
+    }
+
+    #[test]
+    fn d_upper_loops_without_reading_new_line() {
+        // `$!N;D` (N guarded so it never hits real EOF) slides a one-line
+        // window across the whole file without ever printing anything —
+        // every D restart loops back to the top *without* an external
+        // read, so all three lines end up folded into a single cycle.
+        let script = "$!N\nD";
+        let cycles = run_wrapped(script, "a\nb\nc\n");
+
+        assert_eq!(cycles.len(), 1);
+        assert!(!cycles[0].printed);
+        assert_eq!(cycles[0].end_line, 3);
+
+        assert_eq!(real_sed_output(script, "a\nb\nc\n"), "");
+    }
+
+    #[test]
+    fn n_at_eof_under_forced_dash_n_is_a_known_gap() {
+        // Plain `N;D` (unguarded) relies on GNU sed's default behaviour of
+        // autoprinting-then-exiting when `N` hits end of input with no next
+        // line — but that fallback is itself gated on autoprint being on,
+        // and our wrapper always runs with `-n`. So the very last cycle's
+        // tag never fires here, and this tool would show nothing for the
+        // final line even though real (unwrapped) sed prints it — a known,
+        // documented limitation of the current instrumentation.
+        let script = "N\nD";
+        let cycles = run_wrapped(script, "a\nb\nc\n");
+        assert!(cycles.is_empty());
+
+        assert_eq!(real_sed_output(script, "a\nb\nc\n"), "c\n");
     }
 }
