@@ -1,6 +1,6 @@
 # ised — interactive sed
 
-`ised` runs a GNU `sed` script against a file (or stdin) and lets you walk
+`ised` runs a `sed` script against a file (or stdin) and lets you walk
 through the result *cycle by cycle* in a terminal UI, seeing a word-level
 diff of pattern space before/after, before deciding whether to keep each
 change. It's `sed` with a review step, useful when a script's effect on
@@ -16,9 +16,10 @@ isn't obvious just from reading the script.
    via `=`. `d`/`D` are rewritten to branch into this instrumentation
    instead of skipping it outright, and `D`'s restart-without-read loop is
    reproduced faithfully.
-2. **Run once** (`src/runner.rs`): the instrumented script is run through a
-   real `sed -n` over the *entire* input in a single invocation — required
-   to keep `$`-anchored addressing correct.
+2. **Run once** (`src/runner.rs`): the instrumented script is run through
+   the [`sed_rs`](https://docs.rs/sed-rs) engine in quiet (`-n`) mode over
+   the *entire* input in a single invocation — required to keep `$`-anchored
+   addressing correct.
 3. **Group into blocks** (`src/session.rs`, `src/state.rs`): the tagged
    output is parsed back into cycles and grouped into `Block`s — one or more
    consecutive raw input lines a single cycle consumed together (more than
@@ -92,15 +93,17 @@ Rust crate dependencies (`Cargo.toml`):
 - [`clap`](https://crates.io/crates/clap) `4` (derive feature) — CLI argument parsing
 - [`anyhow`](https://crates.io/crates/anyhow) `1` — error handling
 - [`regex`](https://crates.io/crates/regex) `1` — rewriting `d`/`D` commands in the user's script
-
-External:
-
-- **GNU sed** must be installed and on `PATH` — `ised` shells out to the
-  real `sed -n` binary to execute the (instrumented) script; it does not
-  implement sed itself.
+- [`sed-rs`](https://crates.io/crates/sed-rs) `1.1` — GNU-compatible sed
+  engine that executes the (instrumented) script in-process; no external
+  `sed` binary is needed.
 
 ## Known limitations
 
+- Regular expressions are always **extended** (ERE), as with `sed -E`:
+  `sed_rs` has no BRE mode, so write groups as `(...)`, not `\(...\)`.
+  Scripts written for GNU sed's default BRE syntax need adjusting.
+- `\xHH`/`\oNNN` escapes in scripts are not interpreted by `sed_rs` — they
+  are taken literally.
 - `q`/`Q` (early exit) aren't supported yet — the tool expects the script to
   consume the whole input.
 - A trailing `N` at true end-of-input under `-n` (e.g. plain `N;D` on the

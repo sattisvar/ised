@@ -5,12 +5,16 @@
 //! rewriting the couple of commands (`d`, `D`) that would otherwise skip
 //! past that appended code.
 //!
-//! Why instrument sed instead of reimplementing it: sed's actual behaviour
-//! (BRE/ERE quirks, GNU extensions, `N`-at-EOF handling, etc.) is exactly
-//! what we want to preview, so the only way to guarantee we show the truth
-//! is to have the real `sed` binary run the real script and ask it to also
-//! tell us what it's doing, rather than modeling sed ourselves and risking
-//! divergence from the user's actual sed.
+//! Why instrument sed instead of reimplementing it: the sed engine's actual
+//! behaviour (regex quirks, GNU extensions, `N`-at-EOF handling, etc.) is
+//! exactly what we want to preview, so the only way to guarantee we show
+//! the truth is to have the same engine (`sed_rs`) run the real script and
+//! ask it to also tell us what it's doing, rather than modeling sed
+//! ourselves and risking divergence.
+//!
+//! Note `sed_rs` is extended-regex-only (no BRE mode) and does not
+//! interpret `\xHH` escapes in scripts — which is why the placeholder
+//! below is embedded as a literal control character.
 //!
 //! The output is designed to be parsed strictly line-by-line by
 //! `parse_cycles`, which is why every value we extract (pattern space, hold
@@ -131,24 +135,28 @@ pub fn wrap_script(user_script: &str) -> String {
     format!(
         ":{top}\n\
          {{\n{script}\n}}\n\
-         s/\\n/\\x02/g\n\
+         s/\\n/{nl}/g\n\
          s/^/{ptag}/\n\
          p\n\
          b {end}\n\
          :{del}\n\
-         s/\\n/\\x02/g\n\
+         s/\\n/{nl}/g\n\
          s/^/{dtag}/\n\
          p\n\
          :{end}\n\
          =\n\
          x\n\
-         s/\\n/\\x02/g\n\
+         s/\\n/{nl}/g\n\
          s/^/{htag}/\n\
          p\n\
          s/^{htag}//\n\
-         s/\\x02/\\n/g\n\
+         s/{nl}/\\n/g\n\
          x\n",
         script = rewritten,
+        // Written as the literal control character, not a \x02 escape:
+        // sed_rs does not interpret \xHH escapes in scripts (it would take
+        // them literally), but literal control bytes in the script work.
+        nl = NL_PLACEHOLDER,
         ptag = TAG_PATTERN,
         dtag = TAG_DELETED,
         htag = TAG_HOLD,
@@ -233,43 +241,16 @@ pub fn parse_cycles(stdout: &str) -> Vec<Cycle> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    use sed_rs::Sed;
 
     fn run_wrapped(script: &str, input: &str) -> Vec<Cycle> {
         let wrapped = wrap_script(script);
-        let mut child = Command::new("sed")
-            .arg("-n")
-            .arg(&wrapped)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
-        parse_cycles(&String::from_utf8_lossy(&out.stdout))
+        let stdout = Sed::new(&wrapped).unwrap().quiet(true).eval(input).unwrap();
+        parse_cycles(&stdout)
     }
 
     fn real_sed_output(script: &str, input: &str) -> String {
-        let mut child = Command::new("sed")
-            .arg(script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
-        String::from_utf8_lossy(&out.stdout).into_owned()
+        sed_rs::eval(script, input).unwrap()
     }
 
     #[test]
@@ -324,8 +305,9 @@ mod tests {
 
     #[test]
     fn n_merges_pairs_of_lines_into_one_cycle() {
-        // classic "swap adjacent lines" idiom
-        let script = "$!N\ns/\\(.*\\)\\n\\(.*\\)/\\2\\n\\1/";
+        // classic "swap adjacent lines" idiom (ERE groups — sed_rs is
+        // extended-regex-only, there is no BRE mode)
+        let script = "$!N\ns/(.*)\\n(.*)/\\2\\n\\1/";
         let cycles = run_wrapped(script, "a\nb\nc\nd\n");
 
         // lines 1-2 merge into one cycle (N), likewise 3-4.

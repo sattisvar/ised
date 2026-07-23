@@ -1,6 +1,6 @@
 [package]
 name = "ised"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -10,3 +10,4 @@ similar = "2.6"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 regex = "1"
+sed-rs = "1.1.0"

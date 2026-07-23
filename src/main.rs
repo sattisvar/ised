@@ -1,7 +1,7 @@
 //! CLI entry point and final output reconstruction.
 //!
 //! Module map, in dependency order: `instrument` (build the self-reporting
-//! sed script) -> `runner` (shell out to real sed) -> `session` (group its
+//! sed script) -> `runner` (execute it via `sed_rs`) -> `session` (group its
 //! reported cycles into `state::Block`s) -> `ui` (walk the user through
 //! them, collect accept/reject decisions) -> back here to turn those
 //! decisions into the final text.

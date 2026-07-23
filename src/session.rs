@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn swap_adjacent_lines_blocks_and_accepts_correctly() {
         let script = r"$!N
-s/\(.*\)\n\(.*\)/\2\n\1/";
+s/(.*)\n(.*)/\2\n\1/";
         let mut session = Session::new(lines("a\nb\nc\nd\n"), script, false);
 
         assert_eq!(session.block_count().unwrap(), 2);
